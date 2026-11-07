@@ -12,6 +12,9 @@ import {
   type CanvasPatch,
   type CanvasPrimitive,
   type NodeComposeContext,
+  type NodeCompositionPart,
+  type NodeDataPath,
+  type TextPrimitive,
   type NodeCreateContent,
   type NodeEntity,
   type NodeResizeAxes,
@@ -25,7 +28,14 @@ import {
   type TextBlock,
   type TextBlockMetrics
 } from '@skynote/core';
-import { computeGridLinePrimitives, computeTableTracks, buildMergeLookup, getCellBox } from './layout';
+import {
+  composeTableBoundary,
+  composeTableDiagonal,
+  computeGridLinePrimitives,
+  computeTableTracks,
+  buildMergeLookup,
+  getCellBox
+} from './layout';
 import { isTableThemeColor, tableTextColor, tableThemeRegistry, withTableThemeColor } from './themes';
 import { getTableGridStyle, TABLE_GRID_STYLES } from './grid-styles';
 import {
@@ -50,24 +60,70 @@ const CELL_PADDING_Y = 6;
 
 export class TableNodeType implements NodeTypeDefinition {
   static readonly TYPE = TABLE_NODE_TYPE;
+  constructor(
+    private readonly cacheContext?: {
+      dataVersion(nodeId: string): number | undefined;
+      readScope(): object | null;
+    }
+  ) {}
+
   private readonly layouts = new WeakMap<
     TableNodeFields,
     {
+      version: number | undefined;
+      readScope: object | null;
+      rowCount: number;
+      columnCount: number;
+      rowHeights: readonly (number | undefined)[];
+      columnWidths: readonly (number | undefined)[];
+      merges: NonNullable<TableNodeFields['merges']>;
       tracks: ReturnType<typeof computeTableTracks>;
       mergeLookup: ReturnType<typeof buildMergeLookup>;
     }
   >();
 
-  /** 同一不可变表格版本的各单元格共用标尺，避免逐块测量时反复重建。 */
-  private layout(table: TableNodeFields) {
-    let layout = this.layouts.get(table);
-    if (!layout) {
-      layout = {
-        tracks: computeTableTracks(table.rowCount, table.columnCount, table.rows, table.columns),
-        mergeLookup: buildMergeLookup(table.merges, table.rowCount, table.columnCount)
-      };
-      this.layouts.set(table, layout);
+  /** 版本变化时核对几何值快照；撤销和远端字段补丁可能保留原数组引用。 */
+  private layout(node: Readonly<NodeEntity>) {
+    const table = node.table!;
+    const version = this.cacheContext?.dataVersion(node.id);
+    const readScope = this.cacheContext?.readScope() ?? null;
+    const cached = this.layouts.get(table);
+    if (cached && version !== undefined && cached.version === version && cached.readScope === readScope) return cached;
+    if (
+      cached &&
+      cached.rowCount === table.rowCount &&
+      cached.columnCount === table.columnCount &&
+      cached.rowHeights.length === (table.rows?.length ?? 0) &&
+      cached.rowHeights.every((height, index) => height === table.rows![index].height) &&
+      cached.columnWidths.length === (table.columns?.length ?? 0) &&
+      cached.columnWidths.every((width, index) => width === table.columns![index].width) &&
+      cached.merges.length === (table.merges?.length ?? 0) &&
+      cached.merges.every((range, index) => {
+        const current = table.merges![index];
+        return (
+          range.startRow === current.startRow &&
+          range.endRow === current.endRow &&
+          range.startCol === current.startCol &&
+          range.endCol === current.endCol
+        );
+      })
+    ) {
+      cached.version = version;
+      cached.readScope = readScope;
+      return cached;
     }
+    const layout = {
+      version,
+      readScope,
+      rowCount: table.rowCount,
+      columnCount: table.columnCount,
+      rowHeights: (table.rows ?? []).map((row) => row.height),
+      columnWidths: (table.columns ?? []).map((column) => column.width),
+      merges: (table.merges ?? []).map((range) => ({ ...range })),
+      tracks: computeTableTracks(table.rowCount, table.columnCount, table.rows, table.columns),
+      mergeLookup: buildMergeLookup(table.merges, table.rowCount, table.columnCount)
+    };
+    this.layouts.set(table, layout);
     return layout;
   }
 
@@ -329,7 +385,7 @@ export class TableNodeType implements NodeTypeDefinition {
     const table = node.table;
     if (!table || cellPos.row >= table.rowCount || cellPos.col >= table.columnCount) return undefined;
 
-    const { tracks, mergeLookup } = this.layout(table);
+    const { tracks, mergeLookup } = this.layout(node);
     const box = getCellBox(cellPos.row, cellPos.col, tracks, mergeLookup);
     if (box.isCovered) return undefined;
     return Math.max(0, box.width - CELL_PADDING_X * 2);
@@ -347,7 +403,7 @@ export class TableNodeType implements NodeTypeDefinition {
       return { width: node.width, height: node.height };
     }
 
-    const { tracks, mergeLookup } = this.layout(table);
+    const { tracks, mergeLookup } = this.layout(node);
 
     const nextRowHeights: number[] = Array.from({ length: table.rowCount }, (_, r) => {
       const rowMeta = table.rows?.[r];
@@ -429,7 +485,10 @@ export class TableNodeType implements NodeTypeDefinition {
    * 声明式跨引擎中间表示 (IR)：
    * 纯函数，按顺序输出背景外框、斑马纹、表头底色、汇总行底色、自定义单元格背景色、分割线网格以及各单元格文本
    */
-  compose(node: NodeEntity, context: NodeComposeContext): CanvasPrimitive[] {
+
+  private readonly cellBlocks = new WeakMap<readonly TextBlock[], ReadonlyMap<string, number>>();
+
+  private appearance(node: NodeEntity, context: NodeComposeContext) {
     const table: TableNodeFields = node.table ?? {
       rowCount: DEFAULT_TABLE_ROWS,
       columnCount: DEFAULT_TABLE_COLUMNS,
@@ -439,7 +498,7 @@ export class TableNodeType implements NodeTypeDefinition {
     const theme = withTableThemeColor(tableThemeRegistry.getTheme(table.themeId), table.themeColor, context.theme);
     const grid = getTableGridStyle(table.gridStyle);
     const resolvedStyle = resolveNodeStyle(node, this);
-    const { tracks, mergeLookup } = this.layout(table);
+    const { tracks, mergeLookup } = this.layout(node);
 
     // 主题默认值作为底层基线，用户手动设置具有绝对最高优先级
     const isHeaderRow = table.headerRow ?? theme.defaultHeaderRow ?? true;
@@ -452,6 +511,458 @@ export class TableNodeType implements NodeTypeDefinition {
     const headerColFill =
       theme.headerColFill ??
       (theme.headerFill && theme.headerFill !== 'transparent' ? theme.headerFill : context.theme.nodeFill);
+    // 只缓存本次绘制的解析颜色，逐格按绘制顺序叠色，避免扫描背景图元产生平方开销。
+    const parsedColors = new Map<string, RgbaColor>();
+    const textColors = new Map<string, string>();
+    const paint = (background: RgbaColor, color: string | undefined, opacity = 1): RgbaColor => {
+      if (!color || color === 'transparent' || color === 'none') return background;
+      let fill = parsedColors.get(color);
+      if (!fill) {
+        const parsed = parseCssColor(resolveThemeColor(color, context.theme)!);
+        if (!parsed) return background;
+        fill = parsed;
+        parsedColors.set(color, fill);
+      }
+      const alpha = Math.max(0, Math.min(1, fill.a * opacity));
+      return {
+        r: fill.r * alpha + background.r * (1 - alpha),
+        g: fill.g * alpha + background.g * (1 - alpha),
+        b: fill.b * alpha + background.b * (1 - alpha),
+        a: 1
+      };
+    };
+    const baseBackground = paint(parseCssColor(context.theme.background)!, baseFill, node.style?.fillOpacity ?? 1);
+
+    return {
+      table,
+      theme,
+      grid,
+      resolvedStyle,
+      tracks,
+      mergeLookup,
+      isHeaderRow,
+      isHeaderCol,
+      isBandedRows,
+      isTotalRow,
+      baseFill,
+      headerColFill,
+      paint,
+      baseBackground,
+      textColors
+    };
+  }
+
+  private cellText(
+    node: NodeEntity,
+    context: NodeComposeContext,
+    appearance: ReturnType<TableNodeType['appearance']>,
+    block: TextBlock
+  ): CanvasPrimitive[] {
+    const {
+      table,
+      theme,
+      tracks,
+      mergeLookup,
+      isHeaderRow,
+      isHeaderCol,
+      isBandedRows,
+      isTotalRow,
+      baseFill,
+      headerColFill,
+      paint,
+      baseBackground,
+      textColors
+    } = appearance;
+    const primitives: CanvasPrimitive[] = [];
+    if (!block.slot) return [];
+    const cellPos = parseTableCellSlot(block.slot);
+    if (!cellPos) return [];
+    const { row, col } = cellPos;
+    if (row >= table.rowCount || col >= table.columnCount) return [];
+
+    const box = getCellBox(row, col, tracks, mergeLookup);
+    // 被合并的从属单元格不独立渲染文字
+    if (box.isCovered) return [];
+
+    const cellMeta = table.cellMeta?.[cellKey(row, col)];
+    const isHeaderBlock = isHeaderRow && row === 0;
+    const isTotalBlock = isTotalRow && row === table.rowCount - 1;
+    const isHeaderColBlock = isHeaderCol && col === 0;
+
+    const defaultAlign = isHeaderBlock ? (theme.headerAlign ?? 'center') : (theme.bodyAlign ?? 'left');
+    const defaultVAlign = isHeaderBlock
+      ? (theme.headerVerticalAlign ?? 'middle')
+      : (theme.bodyVerticalAlign ?? 'middle');
+
+    const blockStyle = resolveTextBlockStyle(node, block, this);
+
+    let textColor = blockStyle.color;
+    if (isHeaderBlock && theme.headerText) {
+      textColor = theme.headerText;
+    } else if (isTotalBlock && theme.totalText) {
+      textColor = theme.totalText;
+    } else if (isHeaderColBlock && theme.headerColText) {
+      textColor = theme.headerColText;
+    }
+
+    if (block.style?.color !== undefined || node.textStyle?.color !== undefined) {
+      textColor = blockStyle.color;
+    } else if (
+      table.themeColor !== undefined ||
+      cellMeta?.fill !== undefined ||
+      (!isHeaderBlock && !isTotalBlock && !isHeaderColBlock) ||
+      !textColor
+    ) {
+      let background = baseBackground;
+      const bandedStart = isHeaderRow ? 1 : 0;
+      const bandedEnd = isTotalRow ? table.rowCount - 2 : table.rowCount - 1;
+      if (isBandedRows && row >= bandedStart && row <= bandedEnd && row % 2 === 1)
+        background = paint(background, theme.bandedFill ?? context.theme.nodeFill, theme.bandedFillOpacity ?? 0.06);
+      if (isHeaderBlock) background = paint(background, theme.headerFill);
+      if (isHeaderColBlock) background = paint(background, headerColFill, theme.bandedFillOpacity ?? 0.08);
+      if (isTotalBlock && table.rowCount > 1)
+        background = paint(background, theme.totalFill ?? context.theme.nodeFill, 0.12);
+      if (cellMeta?.fill !== undefined)
+        background = paint(
+          background,
+          cellMeta.fill === 'transparent' || cellMeta.fill === 'none' ? baseFill : cellMeta.fill
+        );
+      const backgroundKey = [background.r, background.g, background.b].join(':');
+      textColor = textColors.get(backgroundKey);
+      if (!textColor) {
+        textColor = tableTextColor(background, context.theme);
+        textColors.set(backgroundKey, textColor);
+      }
+    }
+
+    const cellOverflow = cellMeta?.overflow ?? table.cellOverflow ?? 'ellipsis';
+    const effectiveStyle: NodeTextStyle = {
+      ...blockStyle,
+      textAlign: block.style?.textAlign ?? cellMeta?.align ?? blockStyle.textAlign ?? defaultAlign,
+      verticalAlign: block.style?.verticalAlign ?? cellMeta?.verticalAlign ?? blockStyle.verticalAlign ?? defaultVAlign,
+      textOverflow: cellOverflow === 'ellipsis' ? 'ellipsis' : 'clip',
+      color: textColor
+    };
+
+    const innerW = Math.max(0, box.width - CELL_PADDING_X * 2);
+    const innerH = Math.max(0, box.height - CELL_PADDING_Y * 2);
+
+    const primitive = createTextBlockPrimitive(block, effectiveStyle, {
+      x: box.left + CELL_PADDING_X,
+      y: box.top + CELL_PADDING_Y,
+      width: innerW,
+      height: innerH
+    });
+    primitives.push(primitive);
+    return primitives;
+  }
+
+  private background(
+    node: NodeEntity,
+    context: NodeComposeContext,
+    appearance: ReturnType<TableNodeType['appearance']>
+  ): CanvasPrimitive[] {
+    const { table, theme, tracks, isHeaderRow, isHeaderCol, isBandedRows, isTotalRow, baseFill, headerColFill } =
+      appearance;
+    const primitives: CanvasPrimitive[] = [];
+    // 1. 表格主底色矩形 (纯直角单元格容器，无圆角)
+    primitives.push({
+      kind: 'rect',
+      x: 0,
+      y: 0,
+      width: node.width,
+      height: node.height,
+      fill: baseFill,
+      fillOpacity: node.style?.fillOpacity
+    });
+
+    // 2. 隔行斑马纹背景 (若启用)
+    if (isBandedRows && table.rowCount > 1) {
+      const startR = isHeaderRow ? 1 : 0;
+      const endR = isTotalRow ? table.rowCount - 2 : table.rowCount - 1;
+      const bandedFill = theme.bandedFill ?? context.theme.nodeFill;
+      const bandedOpacity = theme.bandedFillOpacity ?? 0.06;
+
+      for (let r = startR; r <= endR; r++) {
+        if (r % 2 === 1) {
+          const rowY = tracks.rowStarts[r];
+          const rowH = tracks.rowStarts[r + 1] - rowY;
+          primitives.push({
+            kind: 'rect',
+            x: 0,
+            y: rowY,
+            width: node.width,
+            height: rowH,
+            fill: bandedFill,
+            fillOpacity: bandedOpacity
+          });
+        }
+      }
+    }
+
+    // 3. 表头行背景高亮 (纯直角，取消圆角)
+    if (isHeaderRow && table.rowCount > 0 && theme.headerFill && theme.headerFill !== 'transparent') {
+      const headerH = tracks.rowStarts[1] - tracks.rowStarts[0];
+      primitives.push({
+        kind: 'rect',
+        x: 0,
+        y: 0,
+        width: node.width,
+        height: headerH,
+        fill: theme.headerFill === '$nodeFill' ? context.theme.nodeFill : theme.headerFill
+      });
+    }
+
+    // 4. 首列背景高亮 (若启用，纯直角)
+    if (isHeaderCol && table.columnCount > 0) {
+      const firstColW = tracks.colStarts[1] - tracks.colStarts[0];
+      primitives.push({
+        kind: 'rect',
+        x: 0,
+        y: 0,
+        width: firstColW,
+        height: node.height,
+        fill: headerColFill,
+        fillOpacity: theme.bandedFillOpacity ?? 0.08
+      });
+    }
+
+    // 5. 汇总行底色高亮 (若启用，纯直角)
+    if (isTotalRow && table.rowCount > 1) {
+      const lastR = table.rowCount - 1;
+      const totalY = tracks.rowStarts[lastR];
+      const totalH = tracks.rowStarts[lastR + 1] - totalY;
+      primitives.push({
+        kind: 'rect',
+        x: 0,
+        y: totalY,
+        width: node.width,
+        height: totalH,
+        fill: theme.totalFill ?? context.theme.nodeFill,
+        fillOpacity: 0.12
+      });
+    }
+
+    return primitives;
+  }
+
+  private cellFill(appearance: ReturnType<TableNodeType['appearance']>, row: number, col: number): CanvasPrimitive[] {
+    const { table, tracks, mergeLookup, baseFill } = appearance;
+    const fill = table.cellMeta?.[cellKey(row, col)]?.fill;
+    const box = getCellBox(row, col, tracks, mergeLookup);
+    return !fill || box.isCovered
+      ? []
+      : [
+          {
+            kind: 'rect',
+            x: box.left,
+            y: box.top,
+            width: box.width,
+            height: box.height,
+            fill: fill === 'transparent' || fill === 'none' ? baseFill : fill
+          }
+        ];
+  }
+
+  composeParts(node: NodeEntity, context: NodeComposeContext): readonly NodeCompositionPart[] {
+    // 字段级补丁可能原位修改标尺，完整失效时不沿用旧几何缓存。
+    this.layouts.delete(node.table!);
+    const appearance = this.appearance(node, context);
+    const { table, tracks, mergeLookup } = appearance;
+    const parts: NodeCompositionPart[] = [{ id: 'background', primitives: this.background(node, context, appearance) }];
+    const blocks = new Map<string, number>();
+    for (const [index, block] of (node.textBlocks ?? []).entries()) {
+      const pos = block.slot && parseTableCellSlot(block.slot);
+      if (pos) blocks.set(cellKey(pos.row, pos.col), index);
+    }
+    this.cellBlocks.set(node.textBlocks ?? [], blocks);
+    for (const kind of ['fill', 'diagonal'] as const) {
+      for (let row = 0; row < table.rowCount; row++)
+        for (let col = 0; col < table.columnCount; col++)
+          parts.push({
+            id: kind + ':' + cellKey(row, col),
+            primitives:
+              kind === 'fill'
+                ? this.cellFill(appearance, row, col)
+                : composeTableDiagonal(table, row, col, tracks, mergeLookup, this.stroke(node, appearance).color)
+          });
+    }
+    const stroke = this.stroke(node, appearance);
+    for (const axis of ['row', 'column'] as const) {
+      const count = axis === 'row' ? table.rowCount : table.columnCount;
+      for (let boundary = 0; boundary <= count; boundary++)
+        parts.push({
+          id: axis + ':' + boundary,
+          primitives: composeTableBoundary(
+            { ...table, totalRow: appearance.isTotalRow },
+            tracks,
+            mergeLookup,
+            axis,
+            boundary,
+            stroke.color,
+            stroke.width,
+            appearance.grid
+          )
+        });
+    }
+    for (const [key, index] of blocks)
+      parts.push({ id: 'text:' + key, primitives: this.cellText(node, context, appearance, node.textBlocks![index]) });
+    return parts;
+  }
+
+  private stroke(
+    node: NodeEntity,
+    appearance: ReturnType<TableNodeType['appearance']>
+  ): { color: string; width: number } {
+    return {
+      color: node.style?.stroke ?? appearance.theme.strokeColor ?? appearance.resolvedStyle.stroke ?? '$nodeStroke',
+      width: node.style?.strokeWidth ?? appearance.grid.strokeWidth ?? appearance.resolvedStyle.strokeWidth ?? 1
+    };
+  }
+
+  composeTextBlock(node: NodeEntity, context: NodeComposeContext, blockId: string): TextPrimitive | undefined {
+    const pos = parseTableCellSlot(blockId);
+    if (!pos || !node.textBlocks) return undefined;
+    const key = cellKey(pos.row, pos.col);
+    let index = this.cellBlocks.get(node.textBlocks)?.get(key);
+    if (index === undefined || node.textBlocks[index]?.id !== blockId) {
+      const blocks = new Map<string, number>();
+      for (const [at, block] of node.textBlocks.entries()) {
+        const cell = block.slot && parseTableCellSlot(block.slot);
+        if (cell) blocks.set(cellKey(cell.row, cell.col), at);
+      }
+      this.cellBlocks.set(node.textBlocks, blocks);
+      index = blocks.get(key);
+    }
+    if (index === undefined) return undefined;
+    return this.cellText(node, context, this.appearance(node, context), node.textBlocks[index]).find(
+      (primitive): primitive is TextPrimitive => primitive.kind === 'text'
+    );
+  }
+
+  composeChangedParts(
+    node: NodeEntity,
+    context: NodeComposeContext,
+    paths: readonly NodeDataPath[]
+  ): readonly NodeCompositionPart[] | null {
+    const blocks = node.textBlocks && this.cellBlocks.get(node.textBlocks);
+    if (!blocks) return null;
+    const keys = new Set<string>();
+    for (const path of paths) {
+      if (path[0] === 'textBlocks' && path.length >= 3 && ['runs', 'style'].includes(String(path[2]))) {
+        const block = node.textBlocks![Number(path[1])];
+        const pos = block?.slot && parseTableCellSlot(block.slot);
+        if (!pos) return null;
+        keys.add('text:' + cellKey(pos.row, pos.col));
+      } else if (path[0] === 'table' && path[1] === 'cellMeta' && typeof path[2] === 'string') {
+        const pos = parseCellKey(path[2]);
+        if (!pos) return null;
+        const { row, col } = pos;
+        const field = path[3];
+        if (field === undefined || field === 'fill') keys.add('fill:' + path[2]);
+        if (field === undefined || ['fill', 'align', 'verticalAlign', 'overflow'].includes(String(field)))
+          keys.add('text:' + path[2]);
+        if (field === undefined || field === 'diagonal') keys.add('diagonal:' + path[2]);
+        if (field === undefined || field === 'borders') {
+          keys.add('row:' + row);
+          keys.add('row:' + (row + 1));
+          keys.add('column:' + col);
+          keys.add('column:' + (col + 1));
+        }
+      } else return null;
+    }
+    const appearance = this.appearance(node, context);
+    const stroke = this.stroke(node, appearance);
+    const result: NodeCompositionPart[] = [];
+    for (const id of keys) {
+      const [kind, key] = id.split(':');
+      let primitives: CanvasPrimitive[];
+      if (kind === 'row' || kind === 'column')
+        primitives = composeTableBoundary(
+          { ...appearance.table, totalRow: appearance.isTotalRow },
+          appearance.tracks,
+          appearance.mergeLookup,
+          kind,
+          Number(key),
+          stroke.color,
+          stroke.width,
+          appearance.grid
+        );
+      else {
+        const pos = parseCellKey(key)!;
+        if (kind === 'text') {
+          const index = blocks.get(key);
+          const block = index === undefined ? undefined : node.textBlocks![index];
+          primitives = block ? this.cellText(node, context, appearance, block) : [];
+        } else if (kind === 'fill') primitives = this.cellFill(appearance, pos.row, pos.col);
+        else
+          primitives = composeTableDiagonal(
+            appearance.table,
+            pos.row,
+            pos.col,
+            appearance.tracks,
+            appearance.mergeLookup,
+            stroke.color
+          );
+      }
+      result.push({ id, primitives });
+    }
+    return result;
+  }
+
+  affectsTextLayout(node: Readonly<NodeEntity>, paths: readonly NodeDataPath[]): boolean {
+    const table = node.table!;
+    // 必须先处理所有几何变化，不能让前面的自动行高文字提前返回并跳过缓存失效。
+    if (paths.some((path) => path[0] === 'table' && (path.length === 1 || path[1] !== 'cellMeta')))
+      this.layouts.delete(table);
+    for (const path of paths) {
+      if (path[0] === 'textBlocks' && path.length >= 3 && ['runs', 'style'].includes(String(path[2]))) {
+        const block = node.textBlocks?.[Number(path[1])];
+        const pos = block?.slot && parseTableCellSlot(block.slot);
+        if (
+          !pos ||
+          (table.cellMeta?.[cellKey(pos.row, pos.col)]?.overflow ?? table.cellOverflow ?? 'ellipsis') === 'auto-height'
+        )
+          return true;
+      } else if (path[0] === 'table' && path[1] === 'cellMeta' && path.length === 3) {
+        // 整项新增/移除可能改变自动行高；只有所有单元格固定高度且无需回缩时才能跳过测量。
+        if (
+          table.cellOverflow === 'auto-height' ||
+          Object.values(table.cellMeta ?? {}).some((meta) => meta.overflow === 'auto-height') ||
+          table.rows?.some((row) => (row.height ?? DEFAULT_ROW_HEIGHT) !== (row.minHeight ?? DEFAULT_ROW_HEIGHT))
+        )
+          return true;
+      } else if (
+        path[0] === 'table' &&
+        path[1] === 'cellMeta' &&
+        path.length >= 4 &&
+        ['fill', 'borders', 'align', 'verticalAlign', 'diagonal'].includes(String(path[3]))
+      )
+        continue;
+      else {
+        this.layouts.delete(table);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  compose(node: NodeEntity, context: NodeComposeContext): CanvasPrimitive[] {
+    const appearance = this.appearance(node, context);
+    const {
+      table,
+      theme,
+      grid,
+      resolvedStyle,
+      tracks,
+      mergeLookup,
+      isHeaderRow,
+      isHeaderCol,
+      isBandedRows,
+      isTotalRow,
+      baseFill,
+      headerColFill
+    } = appearance;
     const primitives: CanvasPrimitive[] = [];
 
     // 1. 表格主底色矩形 (纯直角单元格容器，无圆角)
@@ -616,114 +1127,7 @@ export class TableNodeType implements NodeTypeDefinition {
       )
     );
 
-    // 只缓存本次绘制的解析颜色，逐格按绘制顺序叠色，避免扫描背景图元产生平方开销。
-    const parsedColors = new Map<string, RgbaColor>();
-    const textColors = new Map<string, string>();
-    const paint = (background: RgbaColor, color: string | undefined, opacity = 1): RgbaColor => {
-      if (!color || color === 'transparent' || color === 'none') return background;
-      let fill = parsedColors.get(color);
-      if (!fill) {
-        const parsed = parseCssColor(resolveThemeColor(color, context.theme)!);
-        if (!parsed) return background;
-        fill = parsed;
-        parsedColors.set(color, fill);
-      }
-      const alpha = Math.max(0, Math.min(1, fill.a * opacity));
-      return {
-        r: fill.r * alpha + background.r * (1 - alpha),
-        g: fill.g * alpha + background.g * (1 - alpha),
-        b: fill.b * alpha + background.b * (1 - alpha),
-        a: 1
-      };
-    };
-    const baseBackground = paint(parseCssColor(context.theme.background)!, baseFill, node.style?.fillOpacity ?? 1);
-
-    // 9. 各单元格富文本图元
-    const textBlocks = node.textBlocks ?? [];
-    for (const block of textBlocks) {
-      if (!block.slot) continue;
-      const cellPos = parseTableCellSlot(block.slot);
-      if (!cellPos) continue;
-      const { row, col } = cellPos;
-      if (row >= table.rowCount || col >= table.columnCount) continue;
-
-      const box = getCellBox(row, col, tracks, mergeLookup);
-      // 被合并的从属单元格不独立渲染文字
-      if (box.isCovered) continue;
-
-      const cellMeta = table.cellMeta?.[cellKey(row, col)];
-      const isHeaderBlock = isHeaderRow && row === 0;
-      const isTotalBlock = isTotalRow && row === table.rowCount - 1;
-      const isHeaderColBlock = isHeaderCol && col === 0;
-
-      const defaultAlign = isHeaderBlock ? (theme.headerAlign ?? 'center') : (theme.bodyAlign ?? 'left');
-      const defaultVAlign = isHeaderBlock
-        ? (theme.headerVerticalAlign ?? 'middle')
-        : (theme.bodyVerticalAlign ?? 'middle');
-
-      const blockStyle = resolveTextBlockStyle(node, block, this);
-
-      let textColor = blockStyle.color;
-      if (isHeaderBlock && theme.headerText) {
-        textColor = theme.headerText;
-      } else if (isTotalBlock && theme.totalText) {
-        textColor = theme.totalText;
-      } else if (isHeaderColBlock && theme.headerColText) {
-        textColor = theme.headerColText;
-      }
-
-      if (block.style?.color !== undefined || node.textStyle?.color !== undefined) {
-        textColor = blockStyle.color;
-      } else if (
-        table.themeColor !== undefined ||
-        cellMeta?.fill !== undefined ||
-        (!isHeaderBlock && !isTotalBlock && !isHeaderColBlock) ||
-        !textColor
-      ) {
-        let background = baseBackground;
-        const bandedStart = isHeaderRow ? 1 : 0;
-        const bandedEnd = isTotalRow ? table.rowCount - 2 : table.rowCount - 1;
-        if (isBandedRows && row >= bandedStart && row <= bandedEnd && row % 2 === 1)
-          background = paint(background, theme.bandedFill ?? context.theme.nodeFill, theme.bandedFillOpacity ?? 0.06);
-        if (isHeaderBlock) background = paint(background, theme.headerFill);
-        if (isHeaderColBlock) background = paint(background, headerColFill, theme.bandedFillOpacity ?? 0.08);
-        if (isTotalBlock && table.rowCount > 1)
-          background = paint(background, theme.totalFill ?? context.theme.nodeFill, 0.12);
-        if (cellMeta?.fill !== undefined)
-          background = paint(
-            background,
-            cellMeta.fill === 'transparent' || cellMeta.fill === 'none' ? baseFill : cellMeta.fill
-          );
-        const backgroundKey = [background.r, background.g, background.b].join(':');
-        textColor = textColors.get(backgroundKey);
-        if (!textColor) {
-          textColor = tableTextColor(background, context.theme);
-          textColors.set(backgroundKey, textColor);
-        }
-      }
-
-      const cellOverflow = cellMeta?.overflow ?? table.cellOverflow ?? 'ellipsis';
-      const effectiveStyle: NodeTextStyle = {
-        ...blockStyle,
-        textAlign: block.style?.textAlign ?? cellMeta?.align ?? blockStyle.textAlign ?? defaultAlign,
-        verticalAlign:
-          block.style?.verticalAlign ?? cellMeta?.verticalAlign ?? blockStyle.verticalAlign ?? defaultVAlign,
-        textOverflow: cellOverflow === 'ellipsis' ? 'ellipsis' : 'clip',
-        color: textColor
-      };
-
-      const innerW = Math.max(0, box.width - CELL_PADDING_X * 2);
-      const innerH = Math.max(0, box.height - CELL_PADDING_Y * 2);
-
-      const primitive = createTextBlockPrimitive(block, effectiveStyle, {
-        x: box.left + CELL_PADDING_X,
-        y: box.top + CELL_PADDING_Y,
-        width: innerW,
-        height: innerH
-      });
-      primitives.push(primitive);
-    }
-
+    for (const block of node.textBlocks ?? []) primitives.push(...this.cellText(node, context, appearance, block));
     return primitives;
   }
 }

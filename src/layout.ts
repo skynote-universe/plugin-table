@@ -285,6 +285,88 @@ function pushLineSegment(
   });
 }
 
+/** 单条物理边界独立绘制，局部边框变化只重算相邻边界，同样式连续段合并。 */
+export function composeTableBoundary(
+  table: TableNodeFields,
+  tracks: TableTracks,
+  merges: TableMergeLookup | null,
+  axis: 'row' | 'column',
+  boundary: number,
+  color: string,
+  width: number,
+  grid: TableGridStyleDefinition
+): CanvasPrimitive[] {
+  const result: CanvasPrimitive[] = [];
+  const horizontal = axis === 'row';
+  const starts = horizontal ? tracks.colStarts : tracks.rowStarts;
+  const fixed = (horizontal ? tracks.rowStarts : tracks.colStarts)[boundary];
+  let pending: { start: number; end: number; color: string; width: number; style: TableBorderStyle } | null = null;
+  const flush = (): void => {
+    if (!pending) return;
+    pushLineSegment(
+      result,
+      horizontal ? [pending.start, fixed, pending.end, fixed] : [fixed, pending.start, fixed, pending.end],
+      pending.color,
+      pending.width,
+      pending.style
+    );
+    pending = null;
+  };
+  for (let index = 0; index < starts.length - 1; index++) {
+    const border = resolveTableBorder(
+      table,
+      grid,
+      { visible: true, color, width, style: 'solid' },
+      axis,
+      boundary,
+      index,
+      merges
+    );
+    if (!border?.visible) {
+      flush();
+      continue;
+    }
+    if (pending && pending.color === border.color && pending.width === border.width && pending.style === border.style)
+      pending.end = starts[index + 1];
+    else {
+      flush();
+      pending = {
+        start: starts[index],
+        end: starts[index + 1],
+        color: border.color,
+        width: border.width,
+        style: border.style
+      };
+    }
+  }
+  flush();
+  return result;
+}
+
+export function composeTableDiagonal(
+  table: TableNodeFields,
+  row: number,
+  col: number,
+  tracks: TableTracks,
+  merges: TableMergeLookup | null,
+  color: string
+): CanvasPrimitive[] {
+  const diagonal = table.cellMeta?.[cellKey(row, col)]?.diagonal;
+  const box = getCellBox(row, col, tracks, merges);
+  if (!diagonal || box.isCovered) return [];
+  const direction = typeof diagonal === 'string' ? diagonal : diagonal.direction;
+  if (!direction) return [];
+  const result: CanvasPrimitive[] = [];
+  pushLineSegment(
+    result,
+    direction === 'down' ? [box.left, box.top, box.right, box.bottom] : [box.left, box.bottom, box.right, box.top],
+    typeof diagonal === 'object' ? (diagonal.color ?? color) : color,
+    typeof diagonal === 'object' ? (diagonal.width ?? 1) : 1,
+    typeof diagonal === 'object' ? diagonal.style : undefined
+  );
+  return result;
+}
+
 /** 生成表格全部网格分割线图元 (支持学术三线表、无边框卡片、全网格风格、双实线、斜线表头与单元格独立边框) */
 export function computeGridLinePrimitives(
   table: TableNodeFields,

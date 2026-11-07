@@ -32,6 +32,7 @@ import {
   type TableBorderValues
 } from './border-edit';
 import { TableNodeType } from './table-node';
+import { createTableStylePatches } from './style-patches';
 import {
   MIN_COLUMN_WIDTH,
   MIN_ROW_HEIGHT,
@@ -175,7 +176,10 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
   }
 
   private ctx!: CanvasPluginContext;
-  private readonly nodeType = new TableNodeType();
+  private readonly nodeType = new TableNodeType({
+    dataVersion: (id) => this.ctx.entities.getNode(id)?.runtime.dataVersion,
+    readScope: () => this.ctx.document.readScope
+  });
   private activeSelection: ActiveCellSelection | null = null;
   private dragStart: { pointerId: number; localX: number; localY: number } | null = null;
   private trackDrag: {
@@ -649,7 +653,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     const op = setCellFillOperation(node, { startRow: minR, startCol: minC, endRow: maxR, endCol: maxC }, color);
     this.ctx.document.commit({
       label: '设置单元格底色',
-      patches: [op.patch]
+      patches: createTableStylePatches(node, op.updatedNode)
     });
     return true;
   }
@@ -670,7 +674,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     const op = setCellBordersOperation(node, { startRow: minR, startCol: minC, endRow: maxR, endCol: maxC }, borders);
     this.ctx.document.commit({
       label: '设置单元格边框',
-      patches: [op.patch]
+      patches: createTableStylePatches(node, op.updatedNode)
     });
     return true;
   }
@@ -691,7 +695,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     const op = clearCellBordersOperation(node, { startRow: minR, startCol: minC, endRow: maxR, endCol: maxC });
     this.ctx.document.commit({
       label: '清除单元格边框',
-      patches: [op.patch]
+      patches: createTableStylePatches(node, op.updatedNode)
     });
     return true;
   }
@@ -1098,13 +1102,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
       this.ctx.document.commit({
         label: '设置边框',
         groupId: options?.groupId,
-        patches: [
-          {
-            op: 'set',
-            path: ['content', 'nodes', nodeId],
-            value: { ...next, table: nextTable }
-          }
-        ]
+        patches: createTableStylePatches(original, { ...next, table: nextTable })
       })
     );
   }
@@ -1236,7 +1234,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     );
     this.ctx.document.commit({
       label: '设置对齐方式',
-      patches: [op.patch]
+      patches: createTableStylePatches(node, op.updatedNode)
     });
     return true;
   }
@@ -1257,7 +1255,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     const op = setCellOverflowOperation(node, { startRow: minR, startCol: minC, endRow: maxR, endCol: maxC }, overflow);
     this.ctx.document.commit({
       label: '设置单元格文字溢出策略',
-      patches: [op.patch]
+      patches: createTableStylePatches(node, op.updatedNode)
     });
     return true;
   }
@@ -1274,7 +1272,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     const op = toggleCellDiagonalOperation(node, minR, minC);
     this.ctx.document.commit({
       label: '切换斜线表头',
-      patches: [op.patch]
+      patches: createTableStylePatches(node, op.updatedNode)
     });
     return true;
   }
@@ -1291,7 +1289,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     const op = setCellDiagonalOperation(node, minR, minC, diagonal);
     this.ctx.document.commit({
       label: '设置斜线表头',
-      patches: [op.patch]
+      patches: createTableStylePatches(node, op.updatedNode)
     });
     return true;
   }
@@ -1317,7 +1315,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     );
     this.ctx.document.commit({
       label: '设置边框',
-      patches: [op.patch]
+      patches: createTableStylePatches(node, op.updatedNode)
     });
     return true;
   }

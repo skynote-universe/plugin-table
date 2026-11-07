@@ -975,8 +975,8 @@ describe('TablePlugin Pointer Claiming & InputScope Navigation', () => {
     expect(committedPatches.length).toBeGreaterThan(0);
     const latestCommit = committedPatches[committedPatches.length - 1] as any;
     const latestPatch = latestCommit.patches[0];
-    expect(latestPatch.path).toEqual(['content', 'nodes', node.id]);
-    const cellMeta = latestPatch.value.table.cellMeta as Record<string, any>;
+    expect(latestPatch.path).toEqual(['content', 'nodes', node.id, 'table', 'cellMeta']);
+    const cellMeta = latestPatch.value as Record<string, any>;
     // 检查第 0 行 top 边框和第 1 行 bottom 边框
     expect(cellMeta['0,0']?.borders?.top).toEqual({ width: 2, style: 'solid' });
     expect(cellMeta['1,0']?.borders?.bottom).toEqual({ width: 2, style: 'solid' });
