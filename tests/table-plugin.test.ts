@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  DETACHED_CANVAS_HOST,
   deriveCanvasTheme,
   LIGHT_CANVAS_THEME_SEED,
   SkyNoteEngine,
@@ -8,6 +9,7 @@ import {
   parseCanvasDocument,
   applyMatrix,
   type CanvasKeyboardEvent,
+  type CanvasCursor,
   type CanvasPluginContext,
   type CanvasPointerEvent,
   type NodeEntity
@@ -59,6 +61,31 @@ describe('表格与画布输入入口', () => {
       );
     return { engine, table, id, click, key, text, pointer };
   }
+
+  it.each([
+    ['列选择区域', 50, -10],
+    ['行选择区域', -10, 18],
+    ['插入列加号', 100, -16]
+  ] as const)('%s使用注册的自绘手型光标', (_label, x, y) => {
+    const { engine, id, pointer } = setup();
+    let cursor: CanvasCursor = 'default';
+    engine.attachHost({
+      ...DETACHED_CANVAS_HOST,
+      setCursor(value) {
+        cursor = value;
+      }
+    });
+    try {
+      engine.session.setSelection({ nodeIds: [id], connectorIds: [] });
+      engine.pointer.dispatchPointerMove(pointer(x, y));
+      expect(cursor).toBe('pointer');
+      const rendered = engine.cursors.render(cursor);
+      expect(rendered).toMatchObject({ fallback: 'pointer' });
+      expect(rendered?.svg).toContain('paint-order="stroke"');
+    } finally {
+      engine.destroy();
+    }
+  });
 
   it('拖选同步文字块范围，剪切只清空单元格，矩形粘贴按需扩容并可一步撤销', () => {
     const { engine, id, click, text, pointer } = setup();
@@ -245,6 +272,71 @@ describe('表格与画布输入入口', () => {
     expect(engine.documentStore.undo()).toBe(true);
     expect(text(0, 0)).toBe('甲');
     engine.destroy();
+  });
+
+  it.each([
+    ['列', 50, -10, 150, -10],
+    ['行', -10, 18, -10, 54]
+  ] as const)('选中%s拖动时切换抓取光标，松手恢复悬停光标', (_axis, x, y, targetX, targetY) => {
+    const { engine, click, pointer, text } = setup();
+    const setCursor = vi.fn();
+    engine.attachHost({ ...DETACHED_CANVAS_HOST, setCursor });
+    try {
+      click(x, y);
+      engine.pointer.dispatchPointerMove(pointer(x, y));
+      expect(setCursor).toHaveBeenLastCalledWith('grab');
+      engine.pointer.dispatchPointerDown(pointer(x, y));
+      expect(setCursor).toHaveBeenLastCalledWith('grabbing');
+      engine.pointer.dispatchPointerMove(pointer(400, 200));
+      expect(setCursor).toHaveBeenLastCalledWith('grabbing');
+      engine.pointer.dispatchPointerMove(pointer(targetX, targetY));
+      const up = pointer(targetX, targetY);
+      engine.pointer.dispatchPointerUp(up);
+      expect(up.isClaimed).toBe(true);
+      expect(setCursor).toHaveBeenLastCalledWith('grab');
+      expect(text(0, 0)).toBe(_axis === '列' ? '乙' : '丙');
+      expect(engine.documentStore.undo()).toBe(true);
+      expect(text(0, 0)).toBe('甲');
+    } finally {
+      engine.destroy();
+    }
+  });
+
+  it.each(['cancel', 'blur', 'Escape', 'unmount'] as const)('行列拖动%s时释放指针并恢复光标，不重排数据', (end) => {
+    const { engine, click, pointer, text, key } = setup();
+    const setCursor = vi.fn();
+    const releasePointer = vi.fn();
+    engine.attachHost({ ...DETACHED_CANVAS_HOST, setCursor, releasePointer });
+    click(50, -10);
+    engine.pointer.dispatchPointerDown(pointer(50, -10));
+    engine.pointer.dispatchPointerMove(pointer(150, -10));
+    expect(setCursor).toHaveBeenLastCalledWith('grabbing');
+    releasePointer.mockClear();
+    if (end === 'cancel') engine.pointer.dispatchPointerCancel(pointer(150, -10));
+    else if (end === 'blur') engine.inputScopes.dispatchBlur();
+    else if (end === 'Escape') key('Escape');
+    else engine.destroy();
+    expect(setCursor).toHaveBeenLastCalledWith('default');
+    expect(releasePointer).toHaveBeenCalledTimes(1);
+    if (end !== 'unmount') {
+      expect(text(0, 0)).toBe('甲');
+      engine.destroy();
+    }
+  });
+
+  it('Alt 重排识别拖动方向后使用抓取光标，松手到表格外恢复默认', () => {
+    const { engine, pointer } = setup();
+    const setCursor = vi.fn();
+    engine.attachHost({ ...DETACHED_CANVAS_HOST, setCursor });
+    try {
+      engine.pointer.dispatchPointerDown(pointer(20, 15, true));
+      engine.pointer.dispatchPointerMove(pointer(20, 50, true));
+      expect(setCursor).toHaveBeenLastCalledWith('grabbing');
+      engine.pointer.dispatchPointerUp(pointer(400, 200, true));
+      expect(setCursor).toHaveBeenLastCalledWith('default');
+    } finally {
+      engine.destroy();
+    }
   });
 
   it('分界位置插入与右侧、底部追加经过同一事务入口', () => {

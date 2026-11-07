@@ -1470,6 +1470,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
 
   unmount(): void {
     this.finishResize(false);
+    if (this.trackDrag || this.tableMoveDrag) this.ctx.host.setCursor('default');
     if (this.trackDrag) this.ctx.host?.releasePointer?.(this.trackDrag.pointerId);
     if (this.headerDrag) this.ctx.host?.releasePointer?.(this.headerDrag.pointerId);
     if (this.tableMoveDrag) this.ctx.host?.releasePointer?.(this.tableMoveDrag.pointerId);
@@ -1612,6 +1613,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
       this.renderSelectionOverlay();
     }
     if (this.trackDrag) this.finishTrackDrag(false);
+    if (this.tableMoveDrag) this.ctx.host.setCursor('default');
     if (this.headerDrag) this.ctx.host.releasePointer(this.headerDrag.pointerId);
     if (this.tableMoveDrag) this.ctx.host.releasePointer(this.tableMoveDrag.pointerId);
     this.finishResize(false);
@@ -1923,6 +1925,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
           axis: hit.axis,
           offset: 0
         };
+        this.ctx.host.setCursor('grabbing');
       } else {
         const anchor =
           e.modifiers.shift && this.trackSelection?.nodeId === node.id && this.trackSelection.axis === hit.axis
@@ -2233,7 +2236,11 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
       return;
     }
     if (this.trackDrag) {
-      if (e.pointerId === this.trackDrag.pointerId) this.finishTrackDrag(true);
+      if (e.pointerId === this.trackDrag.pointerId) {
+        e.claimPointer(this.id);
+        this.finishTrackDrag(true);
+        this.updateControlHover(e);
+      }
       return;
     }
     if (this.resizeState) {
@@ -2267,7 +2274,10 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
       return;
     }
     if (this.trackDrag) {
-      if (e.pointerId === this.trackDrag.pointerId) this.finishTrackDrag(false);
+      if (e.pointerId === this.trackDrag.pointerId) {
+        e.claimPointer(this.id);
+        this.finishTrackDrag(false);
+      }
       return;
     }
     this.onPointerUp(e);
@@ -2286,6 +2296,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     const dy = Math.abs(local.y - drag.origin.y);
     if (!drag.axis && Math.max(dx, dy) < 5 / this.ctx.session.viewport.zoom) return;
     drag.axis ??= dx > dy ? 'column' : 'row';
+    this.ctx.host.setCursor('grabbing');
     const { rowCount, columnCount, rows, columns } = node.table;
     const tracks = computeTableTracks(rowCount, columnCount, rows, columns);
     const cell = findCellAtLocalPoint(
@@ -2310,6 +2321,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     if (!drag) return;
     this.trackDrag = null;
     this.ctx.host?.releasePointer?.(drag.pointerId);
+    this.ctx.host.setCursor('default');
     if (commit && drag.axis) this.moveTracksByOffset(drag.nodeId, drag.axis, drag.offset);
     this.renderSelectionOverlay();
     this.syncTopHandle();
