@@ -4,7 +4,7 @@
 
 ## 贡献授权
 
-请阅读许可证第 7 条。该条款授权 skynote-universe 将贡献用于商业版并向第三方再许可。[许可证](https://github.com/skynote-universe/plugin-table/blob/main/LICENSE)
+请阅读许可证第 7 条。该条款授权 SkyNote 将贡献用于商业版并向第三方再许可。[许可证](https://github.com/skynote-universe/plugin-table/blob/main/LICENSE)
 
 许可证版本（请填写对应提交的 LICENSE 永久链接）：
 
