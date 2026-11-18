@@ -5,11 +5,14 @@
 
 import {
   applyMatrix,
+  commitContainerDrop,
+  compareHierarchicalNodes,
   generateId,
   getRunsText,
   measureTextBlock,
   resolveTextBlockStyle,
   invertMatrix,
+  updateContainerDropTarget,
   type CanvasKeyboardEvent,
   type CanvasPluginContext,
   type CanvasPointerEvent,
@@ -114,6 +117,7 @@ import {
 const OVERLAY_SESSION = 'table:selection-overlay';
 const HANDLE_HOVER_SESSION = 'table:handle-hover';
 const RESIZE_PREVIEW_SESSION = 'table:resize-preview';
+const TABLE_DROP_TARGET_SESSION = 'table:drop-target';
 const OUTER_BORDER_MARGIN = 6;
 
 export interface ActiveCellSelection {
@@ -214,7 +218,13 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     axis: TableTrackAxis;
     anchor: number;
   } | null = null;
-  private tableMoveDrag: { pointerId: number; nodeId: string; last: Point; groupId: string } | null = null;
+  private tableMoveDrag: {
+    pointerId: number;
+    nodeId: string;
+    last: Point;
+    groupId: string;
+    dropTarget?: string;
+  } | null = null;
   private readonly cellSelectionListeners = new Set<(sel: ActiveCellSelection | null) => void>();
 
   private getEditableTable(id: string): NodeEntity | undefined {
@@ -1482,6 +1492,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     this.trackDrag = null;
     this.headerDrag = null;
     this.tableMoveDrag = null;
+    this.ctx.host?.overlay.clear(TABLE_DROP_TARGET_SESSION);
     this.dragStart = null;
     this.hoveredTableId = null;
     this.activeHandleNodeId = null;
@@ -1619,6 +1630,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     this.finishResize(false);
     this.headerDrag = null;
     this.tableMoveDrag = null;
+    this.ctx.host.overlay.clear(TABLE_DROP_TARGET_SESSION);
     this.resizeState = null;
     this.controlHover = null;
     this.syncTopHandle();
@@ -1650,7 +1662,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
       ...(this.hoveredTableId ? [this.hoveredTableId] : []),
       ...(this.ctx.session.selectedNodeIds.size === 1 ? this.ctx.session.selectedNodeIds : [])
     ]);
-    if (!hitNode) {
+    if (hitNode?.nodeType !== TableNodeType.TYPE) {
       const distance = 60 / this.ctx.session.viewport.zoom;
       for (const id of this.ctx.spatial.search({
         left: point.x - distance,
@@ -1660,10 +1672,18 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
       }))
         ids.add(id);
     }
+    const getNode = (nodeId: string): NodeEntity | undefined => this.ctx.entities.getNode(nodeId)?.entity;
     for (const id of ids) {
-      if (hitNode && hitNode.id !== id && !this.ctx.session.selectedNodeIds.has(id)) continue;
       const node = this.getEditableTable(id);
       if (!node) continue;
+      if (
+        hitNode &&
+        hitNode.id !== id &&
+        !this.ctx.session.selectedNodeIds.has(id) &&
+        compareHierarchicalNodes(node, hitNode, getNode) <= 0
+      ) {
+        continue;
+      }
       const geometry = this.getControlGeometry(node);
       const hit = hitTableControl(geometry, this.toTableLocal(node, point));
       if (hit) return { node, geometry, hit };
@@ -2080,6 +2100,7 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
         { groupId: drag.groupId, label: '移动表格' }
       );
       drag.last = e.point;
+      drag.dropTarget = updateContainerDropTarget(this.ctx, TABLE_DROP_TARGET_SESSION, [drag.nodeId], e.point);
       this.ctx.host.setCursor('grabbing');
       return;
     }
@@ -2229,8 +2250,13 @@ export class TablePlugin implements SkyNotePlugin, PointerHooks, InputScope, Cli
     if (this.headerDrag?.pointerId === e.pointerId || this.tableMoveDrag?.pointerId === e.pointerId) {
       e.claimPointer(this.id);
       this.ctx.host.releasePointer(e.pointerId);
+      const tableMove = this.tableMoveDrag?.pointerId === e.pointerId ? this.tableMoveDrag : null;
       this.headerDrag = null;
       this.tableMoveDrag = null;
+      this.ctx.host.overlay.clear(TABLE_DROP_TARGET_SESSION);
+      if (tableMove) {
+        commitContainerDrop(this.ctx, [tableMove.nodeId], tableMove.dropTarget, { groupId: tableMove.groupId });
+      }
       this.ctx.host.setCursor('default');
       this.syncTopHandle();
       return;

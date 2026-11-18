@@ -14,7 +14,7 @@ import {
   type CanvasPointerEvent,
   type NodeEntity
 } from '@skynote/core';
-import { ClipboardPlugin, TextEditPlugin } from '@skynote/plugins-basic';
+import { BasicNodesPlugin, ClipboardPlugin, STACK_LAYOUT_ID, TextEditPlugin } from '@skynote/plugins-basic';
 import { TablePlugin } from '../src/table-plugin';
 import { TableNodeType } from '../src/table-node';
 import { TABLE_NODE_TYPE, TABLE_PLUGIN_ID } from '../src/types';
@@ -1149,5 +1149,158 @@ describe('TablePlugin Pointer Claiming & InputScope Navigation', () => {
       width: 2,
       style: 'dashed'
     });
+  });
+
+  it('拖拽表格顶部移动把手可进入与移出画框容器，并支持自动堆叠画框', () => {
+    const engine = new SkyNoteEngine();
+    engine.use(new BasicNodesPlugin());
+    engine.use(new TablePlugin());
+    engine.documentStore.setFontMeasurer({ measureWidth: (text) => text.length * 8 });
+
+    const frameId = engine.documentStore.createNode({
+      nodeType: 'frame',
+      x: 300,
+      y: 0,
+      width: 480,
+      height: 360,
+      options: { title: '容器' }
+    })!;
+    const stackFrameId = engine.documentStore.createNode({
+      nodeType: 'frame',
+      x: 900,
+      y: 0,
+      width: 480,
+      height: 360,
+      options: { title: '堆叠容器' }
+    })!;
+    engine.documentStore.updateNode(stackFrameId, {
+      layout: {
+        type: STACK_LAYOUT_ID,
+        options: { direction: 'horizontal', gap: 16, padding: 24, widthSizing: 'fixed', heightSizing: 'fixed' }
+      }
+    });
+    const tableId = engine.documentStore.createNode({
+      nodeType: TABLE_NODE_TYPE,
+      x: 0,
+      y: 40,
+      options: { rowCount: 2, columnCount: 2, headerRow: false }
+    })!;
+
+    const sessions = new Map<string, unknown>();
+    engine.attachHost({
+      ...DETACHED_CANVAS_HOST,
+      overlay: {
+        setPrimitives(sessionId, primitives) {
+          if (primitives.length === 0) sessions.delete(sessionId);
+          else sessions.set(sessionId, primitives);
+        },
+        clear(sessionId) {
+          sessions.delete(sessionId);
+        }
+      }
+    });
+
+    try {
+      const pointer = (x: number, y: number) => new SyntheticPointerEvent({ point: { x, y } });
+      // 选中表格后点击顶部移动把手 (table 宽度 200，顶部把手中心在 x=100, y=40-34=6)
+      engine.session.setSelection({ nodeIds: [tableId], connectorIds: [] });
+      engine.pointer.dispatchPointerDown(pointer(100, 6));
+      engine.pointer.dispatchPointerMove(pointer(420, 120));
+      expect(sessions.has('table:drop-target')).toBe(true);
+      engine.pointer.dispatchPointerUp(pointer(420, 120));
+      expect(sessions.has('table:drop-target')).toBe(false);
+      expect(engine.documentStore.getNode(tableId)?.parentId).toBe(frameId);
+
+      // 从自由画框拖入自动堆叠画框
+      const inFrame = engine.documentStore.getNode(tableId)!;
+      const handleX = 300 + inFrame.x + inFrame.width / 2;
+      const handleY = inFrame.y - 34;
+      engine.pointer.dispatchPointerDown(pointer(handleX, handleY));
+      engine.pointer.dispatchPointerMove(pointer(950, 80));
+      engine.pointer.dispatchPointerUp(pointer(950, 80));
+      expect(engine.documentStore.getNode(tableId)?.parentId).toBe(stackFrameId);
+      expect(engine.documentStore.getNode(tableId)?.layoutItem).toEqual({});
+
+      // 从自动堆叠画框拖出到画布空白处，应移出容器并清理 layoutItem
+      const inStack = engine.documentStore.getNode(tableId)!;
+      engine.pointer.dispatchPointerDown(pointer(900 + inStack.x + inStack.width / 2, inStack.y - 34));
+      engine.pointer.dispatchPointerMove(pointer(80, 500));
+      engine.pointer.dispatchPointerUp(pointer(80, 500));
+      expect(engine.documentStore.getNode(tableId)?.parentId).toBeUndefined();
+      expect(engine.documentStore.getNode(tableId)?.layoutItem).toBeUndefined();
+    } finally {
+      engine.destroy();
+    }
+  });
+
+  it('容器内部未选中表格时，移出到行列控制带与顶部拖拽把手仍与容器外一致', () => {
+    const engine = new SkyNoteEngine();
+    const tablePlugin = new TablePlugin();
+    engine.use(new BasicNodesPlugin());
+    engine.use(tablePlugin);
+    engine.documentStore.setFontMeasurer({ measureWidth: (text) => text.length * 8 });
+
+    const frameId = engine.documentStore.createNode({
+      nodeType: 'frame',
+      x: 0,
+      y: 0,
+      width: 500,
+      height: 360,
+      options: { title: '容器' }
+    })!;
+    const tableId = engine.documentStore.createNode({
+      nodeType: TABLE_NODE_TYPE,
+      x: 60,
+      y: 60,
+      parentId: frameId,
+      options: { rowCount: 2, columnCount: 2, headerRow: false }
+    })!;
+
+    let cursor: CanvasCursor = 'default';
+    const sessions = new Map<string, unknown>();
+    engine.attachHost({
+      ...DETACHED_CANVAS_HOST,
+      setCursor(value) {
+        cursor = value;
+      },
+      overlay: {
+        setPrimitives(sessionId, primitives) {
+          if (primitives.length === 0) sessions.delete(sessionId);
+          else sessions.set(sessionId, primitives);
+        },
+        clear(sessionId) {
+          sessions.delete(sessionId);
+        }
+      }
+    });
+
+    try {
+      const pointer = (x: number, y: number) => new SyntheticPointerEvent({ point: { x, y } });
+      expect(engine.session.selectedNodeIds.size).toBe(0);
+
+      // 1. 悬停表格主体后移出到顶部列选择带 (y = 60 - 10 = 50)，此时命中节点是外层画框
+      engine.pointer.dispatchPointerMove(pointer(110, 80));
+      expect(sessions.has('table:handle-hover')).toBe(true);
+      engine.pointer.dispatchPointerMove(pointer(110, 50));
+      expect(cursor).toBe('pointer');
+      expect(sessions.has('table:handle-hover')).toBe(true);
+
+      // 2. 点击列选择带应直接选中整列，而不是选中外层画框
+      engine.pointer.dispatchPointerDown(pointer(110, 50));
+      engine.pointer.dispatchPointerUp(pointer(110, 50));
+      expect([...engine.session.selectedNodeIds]).toEqual([tableId]);
+      expect(tablePlugin.getActiveTrackSelection()).toMatchObject({ axis: 'column', start: 0, end: 0 });
+
+      // 3. 取消选中后直接悬停并拖拽顶部移动把手 (x = 160, y = 60 - 34 = 26)
+      engine.session.setSelection({ nodeIds: [], connectorIds: [] });
+      engine.pointer.dispatchPointerMove(pointer(160, 26));
+      expect(cursor).toBe('grab');
+      engine.pointer.dispatchPointerDown(pointer(160, 26));
+      engine.pointer.dispatchPointerMove(pointer(190, 46));
+      engine.pointer.dispatchPointerUp(pointer(190, 46));
+      expect(engine.documentStore.getNode(tableId)).toMatchObject({ x: 90, y: 80, parentId: frameId });
+    } finally {
+      engine.destroy();
+    }
   });
 });
